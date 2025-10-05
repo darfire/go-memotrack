@@ -289,12 +289,7 @@ outerLoop:
 			case CmdAddEvent:
 				tracker.AddEvent(request.payload.(ebpfEventT))
 			case CmdGetAllStats:
-				stats := tracker.ComputeStats()
-				history := tracker.GetTrends()
-				payload := AllStatsPayload{
-					stacks:  stats,
-					history: history,
-				}
+				payload := tracker.GetAllStats()
 				request.responseChan <- NewTrackerResponse(request.requestType, payload, nil)
 			case CmdGetSingleStats:
 				stackId := request.payload.(uint32)
@@ -411,6 +406,16 @@ func (tracker *AllocationTracker) GetTrends() []StackHistory {
 
 func (tracker *AllocationTracker) GetStackHistory(stackId uint32) []SingleStackHistory {
 	return ExtractSingleHistory(tracker.History.ToSlice(), stackId)
+}
+
+func (tracker *AllocationTracker) GetAllStats() AllStatsPayload {
+	stats := tracker.ComputeStats()
+	history := tracker.History.ToSlice()
+
+	return AllStatsPayload{
+		stacks:  stats,
+		history: history,
+	}
 }
 
 func ExtractSingleHistory(history []StackHistory, stackId uint32) []SingleStackHistory {

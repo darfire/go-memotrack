@@ -8,31 +8,20 @@ import (
 	"strings"
 
 	"github.com/chzyer/readline"
-	live_stack "github.com/darfire/go-live-stack"
 )
 
 type Shell struct {
-	ctxs map[int]*live_stack.ProcessContext
+	formatter *Formatter
 }
 
 type ShellOptions struct {
-	Pids []int
+	formatter *Formatter
 }
 
 func NewShell(options ShellOptions) (Shell, error) {
-	ctxs := make(map[int]*live_stack.ProcessContext)
-	for _, pid := range options.Pids {
-		ctx, err := live_stack.NewProcessContext(pid)
-
-		if err != nil {
-			return Shell{}, err
-		}
-
-		ctxs[pid] = &ctx
-	}
 
 	return Shell{
-		ctxs,
+		formatter: options.formatter,
 	}, nil
 }
 
@@ -155,57 +144,6 @@ func (shell *Shell) handleLine(line string) (TrackerRequest, error) {
 	}
 }
 
-func (shell *Shell) formatAllStats(stats AllStatsPayload) string {
-	var sb strings.Builder
-
-	for idx, s := range stats.stacks {
-		history := ExtractSingleHistory(stats.history, s.stackId)
-		sb.WriteString(fmt.Sprintf("%d: %s\n", idx, shell.formatStack(s, history)))
-	}
-
-	return sb.String()
-}
-
-func (shell *Shell) formatStack(stats *StackStats, history []SingleStackHistory) string {
-	var sb strings.Builder
-
-	sb.WriteString(fmt.Sprintf("stackId: %d, name:%s, #objects: %d\n", stats.stackId, stats.objectSpec.Name, stats.countActive))
-
-	sb.WriteString(fmt.Sprintf("ips: %v\n", stats.ips))
-
-	sb.WriteString("pow2Hist: ")
-
-	for k, v := range stats.pow2Hist {
-		sb.WriteString(fmt.Sprintf("%d:%d, ", 1<<k, v))
-	}
-
-	ctx, ok := shell.ctxs[stats.pid]
-
-	if !ok {
-		log.Printf("ctx for pid %d not found", stats.pid)
-		sb.WriteString("\n")
-		return sb.String()
-	}
-
-	frames := ctx.GetStackTrace(stats.ips)
-
-	sb.WriteString("frames:\n")
-
-	for idx, f := range frames {
-		sb.WriteString(fmt.Sprintf("%s\n", f.Describe(idx)))
-	}
-
-	sb.WriteString("history:\n")
-
-	for _, h := range history {
-		sb.WriteString(fmt.Sprintf("%d	", h.Count))
-	}
-
-	sb.WriteString("\n")
-
-	return sb.String()
-}
-
 func (shell *Shell) Format(response TrackerResponse) string {
 	if response.err != nil {
 		return fmt.Sprintf("error: %s", response.err)
@@ -213,10 +151,10 @@ func (shell *Shell) Format(response TrackerResponse) string {
 
 	switch response.requestType {
 	case CmdGetAllStats:
-		return shell.formatAllStats(response.payload.(AllStatsPayload))
+		return shell.formatter.formatAllStats(response.payload.(AllStatsPayload))
 	case CmdGetSingleStats:
 		payload := response.payload.(SingleStatsPayload)
-		return shell.formatStack(payload.stack, payload.history)
+		return shell.formatter.formatStack(payload.stack, payload.history)
 	default:
 		return fmt.Sprintf("unknown response type: %d", response.requestType)
 	}

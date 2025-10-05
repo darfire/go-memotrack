@@ -10,7 +10,9 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -73,11 +75,15 @@ func main() {
 	var executable string
 	var specStrings []string
 	var logLevel string
+	var interactive bool
+	var output string
 
 	flag.IntSliceVar(&pids, "pid", []int{}, "the pid to track")
 	flag.StringVar(&executable, "executable", "", "the executable to track")
 	flag.StringSliceVar(&specStrings, "object", []string{}, "An allocator spec of the form name=alloc1,alloc2|free1,free2,free3")
 	flag.StringVar(&logLevel, "log-level", "info", "log level")
+	flag.BoolVar(&interactive, "interactive", false, "run in interactive mode")
+	flag.StringVar(&output, "output", "-", "file to write report to")
 	flag.Parse()
 
 	logger := slog.New(
@@ -114,12 +120,21 @@ func main() {
 		}
 	}
 
-	/*
-			signalStopper := make(chan os.Signal, 1)
-			signal.Notify(signalStopper, os.Interrupt, syscall.SIGTERM)
+	stopper := make(chan interface{}, 1)
+
+	if !interactive {
+		signalStopper := make(chan os.Signal, 1)
+		signal.Notify(signalStopper, os.Interrupt, syscall.SIGTERM)
 
 		defer close(signalStopper)
-	*/
+
+		go func() {
+			// forward stopped by signal to generic stopper
+			<-signalStopper
+			log.Println("Received signal, exiting..")
+			close(stopper)
+		}()
+	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
@@ -174,17 +189,6 @@ func main() {
 	}
 	defer rd.Close()
 
-	stopper := make(chan interface{}, 1)
-
-	/*
-		go func() {
-			// forward stopped by signal to generic stopper
-			<-signalStopper
-			log.Println("Received signal, exiting..")
-			close(stopper)
-		}()
-	*/
-
 	go func() {
 		<-stopper
 		if err := rd.Close(); err != nil {
@@ -214,31 +218,35 @@ func main() {
 
 	tracker := NewAllocationTracker(trackerOptions)
 
-	shellOptions := ShellOptions{
-		Pids: pids,
-	}
-
-	shell, err := NewShell(shellOptions)
-
-	if err != nil {
-		log.Fatalf("error creating shell: %s", err)
-	}
-
 	requestChan := make(chan TrackerRequest, 128)
 
 	defer close(requestChan)
 
 	go tracker.Run(requestChan, stopper)
 
-	go shell.Run(requestChan, stopper)
+	formatter := NewFormatter(pids)
 
+	if interactive {
+		shellOptions := ShellOptions{
+			formatter: &formatter,
+		}
+		shell, err := NewShell(shellOptions)
+
+		if err != nil {
+			log.Fatalf("error creating shell: %s", err)
+		}
+
+		go shell.Run(requestChan, stopper)
+	}
+
+readLoop:
 	for {
 		record, err := rd.Read()
 		// slog.Debug("received event", "record", record)
 
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				return
+				break readLoop
 			}
 			log.Printf("reading from reader: %s", err)
 			continue
@@ -255,4 +263,19 @@ func main() {
 
 		requestChan <- NewTrackerRequest(CmdAddEvent, event, nil)
 	}
+
+	var outputFile *os.File
+
+	if output == "-" {
+		outputFile = os.Stdout
+	} else {
+		var err error
+		outputFile, err = os.Create(output)
+		if err != nil {
+			log.Fatalf("error creating output file: %s", err)
+		}
+		defer outputFile.Close()
+	}
+
+	outputFile.WriteString(formatter.formatAllStats(tracker.GetAllStats()))
 }
