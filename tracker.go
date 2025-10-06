@@ -132,7 +132,7 @@ func (tracker *AllocationTracker) Add(alloc AllocObject) {
 
 func (tracker *AllocationTracker) Remove(address int64) {
 	if _, ok := tracker.Objects[address]; !ok {
-		slog.Error("object not found", "address", address)
+		slog.Warn("object not found", "address", fmt.Sprintf("%x", address))
 		return
 	}
 

@@ -34,6 +34,8 @@ func NewFormatter(pids []int) Formatter {
 func (formatter *Formatter) formatAllStats(stats AllStatsPayload) string {
 	var sb strings.Builder
 
+	log.Printf("Formatting %d stacks", len(stats.stacks))
+
 	for idx, s := range stats.stacks {
 		history := ExtractSingleHistory(stats.history, s.stackId)
 		sb.WriteString(fmt.Sprintf("%d: %s\n", idx, formatter.formatStack(s, history)))
@@ -45,9 +47,17 @@ func (formatter *Formatter) formatAllStats(stats AllStatsPayload) string {
 func (formatter *Formatter) formatStack(stats *StackStats, history []SingleStackHistory) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("stackId: %d, name:%s, #objects: %d\n", stats.stackId, stats.objectSpec.Name, stats.countActive))
+	sb.WriteString(
+		fmt.Sprintf("stackId: %d, name:%s, #objects: %d, pid: %d\n",
+			stats.stackId, stats.objectSpec.Name, stats.countActive, stats.pid))
 
-	sb.WriteString(fmt.Sprintf("ips: %v\n", stats.ips))
+	ipsStrings := make([]string, len(stats.ips))
+
+	for idx, ip := range stats.ips {
+		ipsStrings[idx] = fmt.Sprintf("0x%x", ip)
+	}
+
+	sb.WriteString(fmt.Sprintf("ips: %s\n", strings.Join(ipsStrings, ", ")))
 
 	sb.WriteString("pow2Hist: ")
 
@@ -68,6 +78,9 @@ func (formatter *Formatter) formatStack(stats *StackStats, history []SingleStack
 	sb.WriteString("frames:\n")
 
 	for idx, f := range frames {
+		if f.IsNull() {
+			break
+		}
 		sb.WriteString(fmt.Sprintf("%s\n", f.Describe(idx)))
 	}
 

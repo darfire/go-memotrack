@@ -19,7 +19,6 @@ type ShellOptions struct {
 }
 
 func NewShell(options ShellOptions) (Shell, error) {
-
 	return Shell{
 		formatter: options.formatter,
 	}, nil

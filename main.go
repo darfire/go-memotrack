@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -21,13 +22,6 @@ import (
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -target amd64 ebpf ebpf.c
-
-type ObjectSpec struct {
-	Type         uint8
-	Name         string
-	Allocators   []string
-	Deallocators []string
-}
 
 func ParseObjectSpec(s string, idx int) (ObjectSpec, error) {
 	var spec ObjectSpec
@@ -72,19 +66,49 @@ func parseLogLevel(level string) slog.Level {
 
 func main() {
 	var pids []int
+	var pidsString string
 	var executable string
 	var specStrings []string
 	var logLevel string
 	var interactive bool
 	var output string
+	var configPath string
+	var config Config
 
-	flag.IntSliceVar(&pids, "pid", []int{}, "the pid to track")
+	flag.IntSliceVar(&pids, "pid", []int{}, "pid of a process to track. Can be specified multiple times.")
+	flag.StringVar(&pidsString, "pids", "", "a space-separate list of pids(meant to be used with pidof)")
 	flag.StringVar(&executable, "executable", "", "the executable to track")
 	flag.StringSliceVar(&specStrings, "object", []string{}, "An allocator spec of the form name=alloc1,alloc2|free1,free2,free3")
 	flag.StringVar(&logLevel, "log-level", "info", "log level")
 	flag.BoolVar(&interactive, "interactive", false, "run in interactive mode")
 	flag.StringVar(&output, "output", "-", "file to write report to")
+	flag.StringVar(&configPath, "config", "", "path to config file")
 	flag.Parse()
+
+	if pidsString != "" {
+		for _, s := range strings.Fields(pidsString) {
+
+			pid, err := strconv.ParseInt(s, 10, 32)
+
+			if err != nil {
+				log.Fatalf("error parsing pid: %s", err)
+			}
+
+			pids = append(pids, int(pid))
+		}
+	}
+
+	if configPath != "" {
+		var err error
+		config, err = ParseConfig(configPath)
+		if err != nil {
+			log.Fatalf("error parsing config: %s", err)
+		}
+	}
+
+	if executable != "" {
+		config.Executable = executable
+	}
 
 	logger := slog.New(
 		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -94,15 +118,9 @@ func main() {
 
 	slog.SetDefault(logger)
 
-	if len(specStrings) > MAX_OBJECT_TYPES {
-		log.Fatalf("too many object types, max is %d", MAX_OBJECT_TYPES)
-	}
-
 	if len(pids) == 0 {
 		log.Fatalf("no pids specified")
 	}
-
-	var specs []ObjectSpec
 
 	for i, s := range specStrings {
 		spec, err := ParseObjectSpec(s, i+1)
@@ -111,13 +129,31 @@ func main() {
 			log.Fatalf("error parsing spec: %s", err)
 		}
 
-		specs = append(specs, spec)
+		config.Objects[spec.Name] = spec
 	}
 
-	for _, s := range specs {
+	if len(config.Objects) > MAX_OBJECT_TYPES {
+		log.Fatalf("too many object types")
+	}
+
+	objects := make([]ObjectSpec, len(config.Objects))
+
+	currentType := uint8(1)
+
+	for _, s := range config.Objects {
 		if len(s.Allocators) == 0 || len(s.Deallocators) == 0 {
 			log.Fatalf("Object %s needs at least one allocator and one deallocator", s.Name)
 		}
+
+		s.Type = currentType
+
+		currentType += 1
+
+		objects = append(objects, s)
+	}
+
+	if len(objects) == 0 {
+		log.Fatalf("no objects specified")
 	}
 
 	stopper := make(chan interface{}, 1)
@@ -147,16 +183,18 @@ func main() {
 	}
 	defer objs.Close()
 
-	ex, err := link.OpenExecutable(executable)
+	log.Printf("Opening executable %s...", config.Executable)
+
+	ex, err := link.OpenExecutable(config.Executable)
 
 	if err != nil {
 		log.Fatalf("opening executable: %v", err)
 	}
 
-	slog.Debug("attached to executable.")
+	slog.Debug("attached to executable.", "path", config.Executable)
 
 	for _, pid := range pids {
-		for _, s := range specs {
+		for _, s := range objects {
 			options := link.UprobeOptions{PID: pid, Cookie: uint64(s.Type)}
 
 			for _, a := range s.Allocators {
@@ -211,7 +249,7 @@ func main() {
 				return ips
 			}
 		},
-		Specs:             specs,
+		Specs:             objects,
 		MaxHistoryBuckets: 128,
 		HistoryIntervalS:  60,
 	}
@@ -266,6 +304,14 @@ readLoop:
 
 	var outputFile *os.File
 
+	var outputName string
+
+	if output == "-" {
+		outputName = "stdout"
+	} else {
+		outputName = output
+	}
+
 	if output == "-" {
 		outputFile = os.Stdout
 	} else {
@@ -274,8 +320,12 @@ readLoop:
 		if err != nil {
 			log.Fatalf("error creating output file: %s", err)
 		}
-		defer outputFile.Close()
 	}
+	defer outputFile.Close()
 
-	outputFile.WriteString(formatter.formatAllStats(tracker.GetAllStats()))
+	stats := tracker.GetAllStats()
+
+	log.Printf("Writing report to %s...", outputName)
+
+	outputFile.WriteString(formatter.formatAllStats(stats))
 }

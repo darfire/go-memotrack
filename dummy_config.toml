@@ -1,0 +1,17 @@
+executable = 'dummy'
+
+[objects]
+
+[objects.obj1]
+allocators = ['make_obj1']
+deallocators = ['free_obj1']
+
+[objects.obj2]
+name = 'obj2'
+allocators = ['make_obj2']
+deallocators = ['free_obj2']
+
+[objects.obj3]
+name = 'obj3'
+allocators = ['make_obj3']
+deallocators = ['free_obj3']
