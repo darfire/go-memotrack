@@ -33,7 +33,7 @@ func ParseObjectSpec(s string, idx int) (ObjectSpec, error) {
 	}
 
 	spec.Name = tokens[0]
-	spec.Type = uint8(idx)
+	spec.Type = uint16(idx)
 
 	allocAndDealloc := strings.Split(tokens[1], "|")
 
@@ -138,7 +138,7 @@ func main() {
 
 	objects := make([]ObjectSpec, len(config.Objects))
 
-	currentType := uint8(1)
+	currentType := uint16(1)
 
 	for _, s := range config.Objects {
 		if len(s.Allocators) == 0 || len(s.Deallocators) == 0 {
@@ -192,27 +192,53 @@ func main() {
 	}
 
 	slog.Debug("attached to executable.", "path", config.Executable)
+	currentProbeId := uint16(0)
+	options := link.UprobeOptions{PID: 0, Cookie: 0}
 
-	for _, pid := range pids {
-		for _, s := range objects {
-			options := link.UprobeOptions{PID: pid, Cookie: uint64(s.Type)}
+	probeSpecs := make([]ProbeSpec, 0)
 
-			for _, a := range s.Allocators {
+	for _, s := range objects {
+		for _, a := range s.Allocators {
+			currentProbeId += 1
+			options.Cookie = uint64(currentProbeId)
+			for _, pid := range pids {
+				options.PID = pid
+
 				up, err := ex.Uretprobe(a, objs.UretprobeMalloc, &options)
 				if err != nil {
 					log.Fatalf("opening allocator probe: %v", err)
 				}
 
+				probeSpecs = append(probeSpecs, ProbeSpec{
+					probeId:    currentProbeId,
+					symbolName: a,
+					probeType:  AllocatorProbe,
+					objectSpec: &s,
+				})
+
 				slog.Debug("attached to allocator", "symbol", a, "pid", pid)
 
 				defer up.Close()
 			}
+		}
 
-			for _, d := range s.Deallocators {
+		for _, d := range s.Deallocators {
+			currentProbeId += 1
+			options.Cookie = uint64(currentProbeId)
+			for _, pid := range pids {
+				options.PID = pid
+
 				up, err := ex.Uprobe(d, objs.UprobeFree, &options)
 				if err != nil {
 					log.Fatalf("opening deallocator probe: %v", err)
 				}
+
+				probeSpecs = append(probeSpecs, ProbeSpec{
+					probeId:    currentProbeId,
+					symbolName: d,
+					probeType:  DeallocatorProbe,
+					objectSpec: &s,
+				})
 
 				slog.Debug("attached to deallocator", "symbol", d, "pid", pid)
 
@@ -221,16 +247,40 @@ func main() {
 		}
 	}
 
-	rd, err := ringbuf.NewReader(objs.Events)
+	for _, reference := range config.References {
+		currentProbeId += 1
+		options.Cookie = uint64(currentProbeId)
+		for _, pid := range pids {
+			options.PID = pid
+
+			up, err := ex.Uprobe(reference, objs.UprobeReference, &options)
+			if err != nil {
+				log.Fatalf("opening reference signal probe: %v", err)
+			}
+
+			probeSpecs = append(probeSpecs, ProbeSpec{
+				probeId:    currentProbeId,
+				symbolName: reference,
+				probeType:  ReferenceProbe,
+			})
+
+			slog.Debug("attached to reference signal", "symbol", reference, "pid", pid)
+
+			defer up.Close()
+		}
+	}
+
+	eventReader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("opening ringbuf reader: %s", err)
 	}
-	defer rd.Close()
+	defer eventReader.Close()
 
 	go func() {
 		<-stopper
-		if err := rd.Close(); err != nil {
-			log.Fatalf("closing ringbuf reader: %s", err)
+		err1 := eventReader.Close()
+		if err1 != nil {
+			log.Fatalf("closing events ringbuf reader: %s", err)
 		}
 	}()
 
@@ -249,9 +299,10 @@ func main() {
 				return ips
 			}
 		},
-		Specs:             objects,
-		MaxHistoryBuckets: 128,
-		HistoryIntervalS:  60,
+		ObjectSpecs:     objects,
+		ProbeSpecs:      probeSpecs,
+		SampleIntervalS: uint64(config.SampleSeconds),
+		MaxStatsBuckets: uint64(config.MaxStatsBuckets),
 	}
 
 	tracker := NewAllocationTracker(trackerOptions)
@@ -279,7 +330,7 @@ func main() {
 
 readLoop:
 	for {
-		record, err := rd.Read()
+		record, err := eventReader.Read()
 		// slog.Debug("received event", "record", record)
 
 		if err != nil {

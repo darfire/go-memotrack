@@ -7,18 +7,9 @@ import (
 	"log/slog"
 	"math"
 	"slices"
-	"time"
 )
 
-type SingleStackHistory struct {
-	Count     uint64
-	Timestamp int64
-}
-
-type StackHistory struct {
-	Stacks    map[uint32]uint64
-	Timestamp int64
-}
+const NS_IN_SEC = 1000000000
 
 type RingBuf[T any] struct {
 	buf []T
@@ -44,12 +35,16 @@ func (rb *RingBuf[T]) Add(item T) {
 	}
 }
 
-func (rb *RingBuf[T]) Get(idx int) T {
+func (rb *RingBuf[T]) Get(idx int) (T, bool) {
 	if idx < 0 || idx >= rb.len {
 		var zero T
-		return zero
+		return zero, false
 	}
-	return rb.buf[(rb.pos-rb.len+idx+rb.cap)%rb.cap]
+	return rb.buf[(rb.pos-rb.len+idx+rb.cap)%rb.cap], true
+}
+
+func (rb *RingBuf[T]) GetLast() (T, bool) {
+	return rb.Get(rb.len - 1)
 }
 
 func (rb *RingBuf[T]) Len() int {
@@ -77,67 +72,98 @@ type AllocObject struct {
 	AllocTstamp uint64
 	Address     int64
 	StackId     uint32
-	Pid         int
-	ObjectType  uint8
+	Pid         uint32
+	Tgid        uint32
+	ProbeId     uint16
+}
+
+type StatsBucket struct {
+	TimeStamp uint64
+	Counts    map[string]int64
+}
+
+const (
+	AllocatorProbe = iota
+	DeallocatorProbe
+	ReferenceProbe
+)
+
+type ProbeSpec struct {
+	probeId    uint16
+	symbolName string
+	probeType  uint8
+	objectSpec *ObjectSpec
 }
 
 type AllocationTracker struct {
 	// a map of current allocated objects
-	Objects map[int64]AllocObject
+	ActiveObjects map[int64]AllocObject
 	// for each stack id we've seen, the associated instruction addresses
 	Stacks map[uint32][]uint64
 	// the defined objects
-	Specs map[uint8]*ObjectSpec
-	// where we stack the history of the allocate object counts, per stack id
-	History RingBuf[StackHistory]
+	ObjectSpecs map[string]*ObjectSpec
+	ProbeSpecs  map[uint16]*ProbeSpec
 	// last time we added to History
 	LastTime uint64
 	// a callback to fetch stack addresses, by stack id
 	LookupStack      LookupStackCb
-	HistoryIntervalS uint64
+	SampleIntervalNs uint64
+	Stats            RingBuf[*StatsBucket]
 }
 
 type LookupStackCb func(uint32) []uint64
 
 type TrackerOptions struct {
-	LookupStack       LookupStackCb
-	Specs             []ObjectSpec
-	HistoryIntervalS  uint64
-	MaxHistoryBuckets uint64
+	LookupStack     LookupStackCb
+	ObjectSpecs     []ObjectSpec
+	ProbeSpecs      []ProbeSpec
+	SampleIntervalS uint64
+	MaxStatsBuckets uint64
 }
 
 func NewAllocationTracker(options TrackerOptions) AllocationTracker {
-	specs := make(map[uint8]*ObjectSpec)
+	objectSpecs := make(map[string]*ObjectSpec)
 
-	for _, s := range options.Specs {
-		specs[s.Type] = &s
+	probeSpecs := make(map[uint16]*ProbeSpec)
+
+	for _, s := range options.ObjectSpecs {
+		objectSpecs[s.Name] = &s
+	}
+
+	for _, s := range options.ProbeSpecs {
+		probeSpecs[s.probeId] = &s
 	}
 
 	return AllocationTracker{
-		Objects:          make(map[int64]AllocObject),
+		ActiveObjects:    make(map[int64]AllocObject),
 		Stacks:           make(map[uint32][]uint64),
 		LastTime:         0,
-		Specs:            specs,
+		ObjectSpecs:      objectSpecs,
+		ProbeSpecs:       probeSpecs,
 		LookupStack:      options.LookupStack,
-		History:          NewRingBuf[StackHistory](int(options.MaxHistoryBuckets)),
-		HistoryIntervalS: options.HistoryIntervalS,
+		SampleIntervalNs: options.SampleIntervalS * NS_IN_SEC,
+		Stats:            NewRingBuf[*StatsBucket](int(options.MaxStatsBuckets)),
 	}
 }
 
 func (tracker *AllocationTracker) Add(alloc AllocObject) {
 	// slog.Debug("adding alloc", "address", alloc.Address, "stackId", alloc.StackId)
-	tracker.Objects[alloc.Address] = alloc
+	tracker.ActiveObjects[alloc.Address] = alloc
 	tracker.LastTime = max(tracker.LastTime, alloc.AllocTstamp)
 }
 
-func (tracker *AllocationTracker) Remove(address int64) {
-	if _, ok := tracker.Objects[address]; !ok {
+func (tracker *AllocationTracker) Remove(address int64) (AllocObject, bool) {
+	alloc, ok := tracker.ActiveObjects[address]
+
+	if !ok {
 		slog.Warn("object not found", "address", fmt.Sprintf("%x", address))
-		return
+		return AllocObject{}, false
 	}
 
 	// slog.Debug("removing alloc", "address", address)
-	delete(tracker.Objects, address)
+	delete(tracker.ActiveObjects, address)
+
+	return alloc, true
 }
 
 func (tracker *AllocationTracker) HasStack(stackId uint32) bool {
@@ -153,7 +179,7 @@ func (tracker *AllocationTracker) MaybeAddStack(stackId int64, lookup_stack func
 }
 
 func (tracker *AllocationTracker) PrintStatus() {
-	log.Printf("%d allocations, %d stacks", len(tracker.Objects), len(tracker.Stacks))
+	log.Printf("%d allocations, %d stacks", len(tracker.ActiveObjects), len(tracker.Stacks))
 }
 
 type StackStats struct {
@@ -162,7 +188,8 @@ type StackStats struct {
 	objectSpec  *ObjectSpec
 	pow2Hist    []uint64
 	ips         []uint64
-	pid         int
+	pid         uint32
+	tgid        uint32
 }
 
 func (s *StackStats) updateHist(delta uint64) {
@@ -187,48 +214,83 @@ func (s *StackStats) updateHist(delta uint64) {
 func (tracker *AllocationTracker) AddEvent(event ebpfEventT) {
 	// slog.Debug("received event", "type", event.Type, "addr", event.Addr, "stackId", event.StackId, "pid", event.Pid)
 
-	if event.Type == 0 {
+	probeSpec, ok := tracker.ProbeSpecs[event.ProbeId]
+
+	if !ok {
+		log.Printf("unknown probe id: %d", event.ProbeId)
+		return
+	}
+
+	pid := uint32((event.PidTgid >> 32) & 0xffffffff)
+	tgid := uint32(event.PidTgid & 0xffffffff)
+
+	switch probeSpec.probeType {
+	case AllocatorProbe:
 		tracker.Add(AllocObject{
 			AllocTstamp: event.Tstamp,
 			Address:     event.Addr,
 			StackId:     event.StackId,
-			ObjectType:  event.ObjectType,
-			Pid:         int(event.Pid),
+			ProbeId:     event.ProbeId,
+			Pid:         pid,
+			Tgid:        tgid,
 		})
 
 		if !tracker.HasStack(event.StackId) {
 			ips := tracker.LookupStack(event.StackId)
 			tracker.AddStack(event.StackId, ips)
 		}
-	} else {
-		tracker.Remove(event.Addr)
+
+		tracker.IncStats(event.Tstamp, fmt.Sprintf("stack:%d:alloc", event.StackId))
+	case DeallocatorProbe:
+		alloc, ok := tracker.Remove(event.Addr)
+		if !ok {
+			slog.Warn("object not found", "address", fmt.Sprintf("%x", event.Addr))
+			return
+		} else {
+			tracker.IncStats(event.Tstamp, fmt.Sprintf("stack:%d:free", alloc.StackId))
+			tracker.DecStats(event.Tstamp, fmt.Sprintf("stack:%d:objects", alloc.StackId))
+		}
+	case ReferenceProbe:
+		tracker.IncStats(event.Tstamp, fmt.Sprintf("reference:%s", probeSpec.symbolName))
+	default:
+		panic(fmt.Sprintf("unknown probe type: %d", probeSpec.probeType))
 	}
 
 	// slog.Debug("after event handle", "objects", len(tracker.Objects), "stacks", len(tracker.Stacks))
 }
 
-func (tracker *AllocationTracker) PushHistory() {
-	counts := make(map[uint32]uint64)
+func (tracker *AllocationTracker) GetStatsBucket(tstamp uint64) *StatsBucket {
+	startInterval := tstamp - (tstamp % tracker.SampleIntervalNs)
 
-	for _, alloc := range tracker.Objects {
-		_, ok := counts[alloc.StackId]
+	last, ok := tracker.Stats.GetLast()
 
-		if !ok {
-			counts[alloc.StackId] = 1
-		} else {
-			counts[alloc.StackId] += 1
+	if !ok || last.TimeStamp != startInterval {
+		last := &StatsBucket{
+			TimeStamp: startInterval,
+			Counts:    make(map[string]int64),
 		}
+		tracker.Stats.Add(last)
 	}
 
-	tracker.History.Add(StackHistory{
-		Stacks:    counts,
-		Timestamp: time.Now().Unix(),
-	})
+	return last
+}
+
+func (tracker *AllocationTracker) IncStats(tstamp uint64, key string) {
+	last := tracker.GetStatsBucket(tstamp)
+
+	last.Counts[key]++
+}
+
+func (tracker *AllocationTracker) DecStats(tstamp uint64, key string) {
+	last := tracker.GetStatsBucket(tstamp)
+
+	last.Counts[key]--
 }
 
 const (
 	CmdNop = iota
 	CmdAddEvent
+	CmdAddReferenceEvent
 	CmdGetAllStats
 	CmdGetSingleStats
 	CmdGetTrends
@@ -242,13 +304,11 @@ type TrackerRequest struct {
 }
 
 type AllStatsPayload struct {
-	stacks  []*StackStats
-	history []StackHistory
+	stacks []*StackStats
 }
 
 type SingleStatsPayload struct {
-	stack   *StackStats
-	history []SingleStackHistory
+	stack *StackStats
 }
 
 type TrackerResponse struct {
@@ -277,9 +337,6 @@ func (tracker *AllocationTracker) Run(
 	requestChan chan TrackerRequest,
 	stopper chan interface{},
 ) {
-	timer := time.NewTimer(time.Duration(tracker.HistoryIntervalS) * time.Second)
-	defer timer.Stop()
-
 outerLoop:
 	for {
 		select {
@@ -293,23 +350,18 @@ outerLoop:
 				request.responseChan <- NewTrackerResponse(request.requestType, payload, nil)
 			case CmdGetSingleStats:
 				stackId := request.payload.(uint32)
-				history := tracker.GetStackHistory(stackId)
 				stack, err := tracker.GetStackStats(stackId)
 				payload := SingleStatsPayload{
-					stack:   &stack,
-					history: history,
+					stack: &stack,
 				}
 				request.responseChan <- NewTrackerResponse(request.requestType, payload, err)
 			case CmdGetTrends:
-				trends := tracker.GetTrends()
-				request.responseChan <- NewTrackerResponse(request.requestType, trends, nil)
+				// todo
 			case CmdNop:
 				// nothing
 			case CmdExit:
 				break outerLoop
 			}
-		case <-timer.C:
-			tracker.PushHistory()
 		case <-stopper:
 			break outerLoop
 		}
@@ -319,7 +371,7 @@ outerLoop:
 func (tracker *AllocationTracker) ComputeStats() []*StackStats {
 	stats := make(map[uint32]*StackStats)
 
-	for _, alloc := range tracker.Objects {
+	for _, alloc := range tracker.ActiveObjects {
 		if !tracker.HasStack(alloc.StackId) {
 			slog.Warn("stack not found", "stackId", alloc.StackId)
 			continue
@@ -328,7 +380,9 @@ func (tracker *AllocationTracker) ComputeStats() []*StackStats {
 		if _, ok := stats[alloc.StackId]; !ok {
 			ips := tracker.Stacks[alloc.StackId]
 
-			spec, ok := tracker.Specs[alloc.ObjectType]
+			probeSpec, ok := tracker.ProbeSpecs[alloc.ProbeId]
+
+			objectSpec := probeSpec.objectSpec
 
 			if !ok {
 				continue
@@ -337,10 +391,11 @@ func (tracker *AllocationTracker) ComputeStats() []*StackStats {
 			stats[alloc.StackId] = &StackStats{
 				countActive: 1,
 				stackId:     alloc.StackId,
-				objectSpec:  spec,
+				objectSpec:  objectSpec,
 				pow2Hist:    make([]uint64, 16),
 				ips:         ips,
 				pid:         alloc.Pid,
+				tgid:        alloc.Tgid,
 			}
 		} else {
 			stats[alloc.StackId].countActive += 1
@@ -368,7 +423,7 @@ func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, err
 
 	var stats *StackStats
 
-	for _, alloc := range tracker.Objects {
+	for _, alloc := range tracker.ActiveObjects {
 		if alloc.StackId != stackId {
 			continue
 		}
@@ -376,7 +431,7 @@ func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, err
 		if stats == nil {
 			ips := tracker.Stacks[alloc.StackId]
 
-			spec, ok := tracker.Specs[alloc.ObjectType]
+			probeSpec, ok := tracker.ProbeSpecs[alloc.ProbeId]
 
 			if !ok {
 				panic(fmt.Sprintf("stack %d not found in specs", stackId))
@@ -386,7 +441,7 @@ func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, err
 				countActive: 1,
 				stackId:     alloc.StackId,
 				pid:         alloc.Pid,
-				objectSpec:  spec,
+				objectSpec:  probeSpec.objectSpec,
 				pow2Hist:    make([]uint64, 16),
 				ips:         ips,
 			}
@@ -400,40 +455,10 @@ func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, err
 	return *stats, nil
 }
 
-func (tracker *AllocationTracker) GetTrends() []StackHistory {
-	return tracker.History.ToSlice()
-}
-
-func (tracker *AllocationTracker) GetStackHistory(stackId uint32) []SingleStackHistory {
-	return ExtractSingleHistory(tracker.History.ToSlice(), stackId)
-}
-
 func (tracker *AllocationTracker) GetAllStats() AllStatsPayload {
 	stats := tracker.ComputeStats()
-	history := tracker.History.ToSlice()
 
 	return AllStatsPayload{
-		stacks:  stats,
-		history: history,
+		stacks: stats,
 	}
-}
-
-func ExtractSingleHistory(history []StackHistory, stackId uint32) []SingleStackHistory {
-	response := make([]SingleStackHistory, 0, len(history))
-
-	for _, h := range history {
-		if count, ok := h.Stacks[stackId]; ok {
-			response = append(response, SingleStackHistory{
-				Count:     count,
-				Timestamp: h.Timestamp,
-			})
-		} else if len(response) > 0 {
-			response = append(response, SingleStackHistory{
-				Count:     0,
-				Timestamp: h.Timestamp,
-			})
-		}
-	}
-
-	return response
 }

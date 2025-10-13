@@ -16,13 +16,13 @@ type Formatter struct {
 func NewFormatter(pids []int) Formatter {
 	ctxs := make(map[int]*live_stack.ProcessContext)
 	for _, pid := range pids {
-		ctx, err := live_stack.NewProcessContext(pid)
+		ctx, err := live_stack.NewProcessContext(int(pid))
 
 		if err != nil {
 			panic(err)
 		}
 
-		ctxs[pid] = &ctx
+		ctxs[int(pid)] = &ctx
 	}
 
 	return Formatter{
@@ -37,14 +37,13 @@ func (formatter *Formatter) formatAllStats(stats AllStatsPayload) string {
 	log.Printf("Formatting %d stacks", len(stats.stacks))
 
 	for idx, s := range stats.stacks {
-		history := ExtractSingleHistory(stats.history, s.stackId)
-		sb.WriteString(fmt.Sprintf("%d: %s\n", idx, formatter.formatStack(s, history)))
+		sb.WriteString(fmt.Sprintf("%d: %s\n", idx, formatter.formatStack(s)))
 	}
 
 	return sb.String()
 }
 
-func (formatter *Formatter) formatStack(stats *StackStats, history []SingleStackHistory) string {
+func (formatter *Formatter) formatStack(stats *StackStats) string {
 	var sb strings.Builder
 
 	sb.WriteString(
@@ -65,7 +64,7 @@ func (formatter *Formatter) formatStack(stats *StackStats, history []SingleStack
 		sb.WriteString(fmt.Sprintf("%d:%d, ", 1<<k, v))
 	}
 
-	ctx, ok := formatter.ctxs[stats.pid]
+	ctx, ok := formatter.ctxs[int(stats.pid)]
 
 	if !ok {
 		log.Printf("ctx for pid %d not found", stats.pid)
@@ -82,12 +81,6 @@ func (formatter *Formatter) formatStack(stats *StackStats, history []SingleStack
 			break
 		}
 		sb.WriteString(fmt.Sprintf("%s\n", f.Describe(idx)))
-	}
-
-	sb.WriteString("history:\n")
-
-	for _, h := range history {
-		sb.WriteString(fmt.Sprintf("%d	", h.Count))
 	}
 
 	sb.WriteString("\n")

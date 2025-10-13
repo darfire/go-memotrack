@@ -19,9 +19,7 @@ type ShellOptions struct {
 }
 
 func NewShell(options ShellOptions) (Shell, error) {
-	return Shell{
-		formatter: options.formatter,
-	}, nil
+	return Shell(options), nil
 }
 
 func (shell *Shell) Run(requestChan chan TrackerRequest, stopper chan interface{}) {
@@ -153,7 +151,7 @@ func (shell *Shell) Format(response TrackerResponse) string {
 		return shell.formatter.formatAllStats(response.payload.(AllStatsPayload))
 	case CmdGetSingleStats:
 		payload := response.payload.(SingleStatsPayload)
-		return shell.formatter.formatStack(payload.stack, payload.history)
+		return shell.formatter.formatStack(payload.stack)
 	default:
 		return fmt.Sprintf("unknown response type: %d", response.requestType)
 	}
