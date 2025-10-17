@@ -21,9 +21,10 @@ type Config struct {
 
 func ParseConfig(path string) (Config, error) {
 	config := Config{
-		Objects:       make(map[string]ObjectSpec),
-		Executable:    "",
-		SampleSeconds: 60,
+		Objects:         make(map[string]ObjectSpec),
+		Executable:      "",
+		SampleSeconds:   60,
+		MaxStatsBuckets: 1024,
 	}
 
 	_, err := toml.DecodeFile(path, &config)

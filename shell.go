@@ -118,23 +118,6 @@ func (shell *Shell) handleLine(line string) (TrackerRequest, error) {
 		}
 		stackId := uint32(parsedStackId)
 		return NewTrackerRequest(CmdGetSingleStats, stackId, make(chan TrackerResponse, 1)), nil
-	case "trends":
-		var stackId uint32
-
-		stackId = 0
-
-		if len(tokens) > 1 {
-			var err error
-			parsedStackId, err := strconv.ParseUint(tokens[1], 10, 32)
-			if err != nil {
-				fmt.Printf("error parsing stack id: %s\n", err)
-				return NewTrackerRequest(CmdNop, nil, nil), nil
-			}
-
-			stackId = uint32(parsedStackId)
-		}
-
-		return NewTrackerRequest(CmdGetTrends, stackId, make(chan TrackerResponse, 1)), nil
 	default:
 		fmt.Printf("unknown command: '%s'\n", line)
 		return NewTrackerRequest(CmdNop, nil, nil), nil
@@ -148,7 +131,7 @@ func (shell *Shell) Format(response TrackerResponse) string {
 
 	switch response.requestType {
 	case CmdGetAllStats:
-		return shell.formatter.formatAllStats(response.payload.(AllStatsPayload))
+		return shell.formatter.formatAllStats(response.payload.([]*StackStats))
 	case CmdGetSingleStats:
 		payload := response.payload.(SingleStatsPayload)
 		return shell.formatter.formatStack(payload.stack)

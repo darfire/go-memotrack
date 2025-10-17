@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -71,7 +73,7 @@ func main() {
 	var specStrings []string
 	var logLevel string
 	var interactive bool
-	var output string
+	var outputDir string
 	var configPath string
 	var config Config
 
@@ -81,7 +83,7 @@ func main() {
 	flag.StringSliceVar(&specStrings, "object", []string{}, "An allocator spec of the form name=alloc1,alloc2|free1,free2,free3")
 	flag.StringVar(&logLevel, "log-level", "info", "log level")
 	flag.BoolVar(&interactive, "interactive", false, "run in interactive mode")
-	flag.StringVar(&output, "output", "-", "file to write report to")
+	flag.StringVar(&outputDir, "output-dir", "", "directory to write reports in")
 	flag.StringVar(&configPath, "config", "", "path to config file")
 	flag.Parse()
 
@@ -313,7 +315,23 @@ func main() {
 
 	go tracker.Run(requestChan, stopper)
 
-	formatter := NewFormatter(pids)
+	executableFname := path.Base(config.Executable)
+
+	if outputDir == "" {
+		outputDir = fmt.Sprintf("reports-%s-%d", executableFname, time.Now().Unix())
+	}
+
+	formatterOptions := FormatterOptions{
+		pids:      pids,
+		reportDir: outputDir,
+	}
+
+	formatter := NewFormatter(formatterOptions)
+
+	defer func() {
+		formatter.writeStacks(tracker.GetStacks())
+		formatter.writeTraces(tracker.GetTraces())
+	}()
 
 	if interactive {
 		shellOptions := ShellOptions{
@@ -352,31 +370,4 @@ readLoop:
 
 		requestChan <- NewTrackerRequest(CmdAddEvent, event, nil)
 	}
-
-	var outputFile *os.File
-
-	var outputName string
-
-	if output == "-" {
-		outputName = "stdout"
-	} else {
-		outputName = output
-	}
-
-	if output == "-" {
-		outputFile = os.Stdout
-	} else {
-		var err error
-		outputFile, err = os.Create(output)
-		if err != nil {
-			log.Fatalf("error creating output file: %s", err)
-		}
-	}
-	defer outputFile.Close()
-
-	stats := tracker.GetAllStats()
-
-	log.Printf("Writing report to %s...", outputName)
-
-	outputFile.WriteString(formatter.formatAllStats(stats))
 }

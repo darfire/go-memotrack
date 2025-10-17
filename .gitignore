@@ -2,3 +2,4 @@
 go-memotrack
 *_bpfel.go
 dummy
+reports-*/

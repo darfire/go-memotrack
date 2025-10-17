@@ -52,7 +52,7 @@ func (rb *RingBuf[T]) Len() int {
 }
 
 func (rb *RingBuf[T]) ToSlice() []T {
-	slice := make([]T, rb.len)
+	slice := make([]T, 0, rb.len)
 
 	start := (rb.pos - rb.len + rb.cap) % rb.cap
 
@@ -190,6 +190,7 @@ type StackStats struct {
 	ips         []uint64
 	pid         uint32
 	tgid        uint32
+	err         error
 }
 
 func (s *StackStats) updateHist(delta uint64) {
@@ -265,10 +266,11 @@ func (tracker *AllocationTracker) GetStatsBucket(tstamp uint64) *StatsBucket {
 	last, ok := tracker.Stats.GetLast()
 
 	if !ok || last.TimeStamp != startInterval {
-		last := &StatsBucket{
+		last = &StatsBucket{
 			TimeStamp: startInterval,
 			Counts:    make(map[string]int64),
 		}
+
 		tracker.Stats.Add(last)
 	}
 
@@ -293,7 +295,7 @@ const (
 	CmdAddReferenceEvent
 	CmdGetAllStats
 	CmdGetSingleStats
-	CmdGetTrends
+	CmdGetTraces
 	CmdExit
 )
 
@@ -301,10 +303,6 @@ type TrackerRequest struct {
 	requestType  uint8
 	responseChan chan TrackerResponse
 	payload      interface{}
-}
-
-type AllStatsPayload struct {
-	stacks []*StackStats
 }
 
 type SingleStatsPayload struct {
@@ -346,17 +344,15 @@ outerLoop:
 			case CmdAddEvent:
 				tracker.AddEvent(request.payload.(ebpfEventT))
 			case CmdGetAllStats:
-				payload := tracker.GetAllStats()
+				payload := tracker.GetStacks()
 				request.responseChan <- NewTrackerResponse(request.requestType, payload, nil)
 			case CmdGetSingleStats:
 				stackId := request.payload.(uint32)
-				stack, err := tracker.GetStackStats(stackId)
-				payload := SingleStatsPayload{
-					stack: &stack,
-				}
-				request.responseChan <- NewTrackerResponse(request.requestType, payload, err)
-			case CmdGetTrends:
-				// todo
+				stack := tracker.GetStackStats(stackId)
+				request.responseChan <- NewTrackerResponse(request.requestType, stack, nil)
+			case CmdGetTraces:
+				traces := tracker.GetTraces()
+				request.responseChan <- NewTrackerResponse(request.requestType, traces, nil)
 			case CmdNop:
 				// nothing
 			case CmdExit:
@@ -384,8 +380,10 @@ func (tracker *AllocationTracker) ComputeStats() []*StackStats {
 
 			objectSpec := probeSpec.objectSpec
 
+			var err error
+
 			if !ok {
-				continue
+				err = fmt.Errorf("stack %d not found in specs", alloc.StackId)
 			}
 
 			stats[alloc.StackId] = &StackStats{
@@ -396,12 +394,13 @@ func (tracker *AllocationTracker) ComputeStats() []*StackStats {
 				ips:         ips,
 				pid:         alloc.Pid,
 				tgid:        alloc.Tgid,
+				err:         err,
 			}
 		} else {
 			stats[alloc.StackId].countActive += 1
 		}
 
-		stats[alloc.StackId].updateHist((tracker.LastTime - alloc.AllocTstamp) / 1000000000.)
+		stats[alloc.StackId].updateHist((tracker.LastTime - alloc.AllocTstamp) / NS_IN_SEC)
 	}
 
 	sortedByCount := make([]*StackStats, 0, len(stats))
@@ -416,9 +415,11 @@ func (tracker *AllocationTracker) ComputeStats() []*StackStats {
 	return sortedByCount
 }
 
-func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, error) {
+func (tracker *AllocationTracker) GetStackStats(stackId uint32) StackStats {
 	if !tracker.HasStack(stackId) {
-		return StackStats{}, fmt.Errorf("stack %d not found", stackId)
+		return StackStats{
+			err: fmt.Errorf("stack %d not found", stackId),
+		}
 	}
 
 	var stats *StackStats
@@ -433,8 +434,10 @@ func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, err
 
 			probeSpec, ok := tracker.ProbeSpecs[alloc.ProbeId]
 
+			var err error
+
 			if !ok {
-				panic(fmt.Sprintf("stack %d not found in specs", stackId))
+				err = fmt.Errorf("stack %d not found in specs", stackId)
 			}
 
 			stats = &StackStats{
@@ -444,21 +447,22 @@ func (tracker *AllocationTracker) GetStackStats(stackId uint32) (StackStats, err
 				objectSpec:  probeSpec.objectSpec,
 				pow2Hist:    make([]uint64, 16),
 				ips:         ips,
+				err:         err,
 			}
 		} else {
 			stats.countActive += 1
 		}
 
-		stats.updateHist((tracker.LastTime - alloc.AllocTstamp) / 1000000000.)
+		stats.updateHist((tracker.LastTime - alloc.AllocTstamp) / NS_IN_SEC)
 	}
 
-	return *stats, nil
+	return *stats
 }
 
-func (tracker *AllocationTracker) GetAllStats() AllStatsPayload {
-	stats := tracker.ComputeStats()
+func (tracker *AllocationTracker) GetStacks() []*StackStats {
+	return tracker.ComputeStats()
+}
 
-	return AllStatsPayload{
-		stacks: stats,
-	}
+func (tracker *AllocationTracker) GetTraces() []*StatsBucket {
+	return tracker.Stats.ToSlice()
 }
