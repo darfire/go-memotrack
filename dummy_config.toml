@@ -1,5 +1,7 @@
 executable = 'dummy'
 
+references = ['do_object']
+
 [objects]
 
 [objects.obj1]

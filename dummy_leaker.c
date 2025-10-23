@@ -8,6 +8,9 @@
 
 #define MAX_OBJECTS 16
 
+#define NSECS_IN_SEC 1000000000
+
+
 typedef struct {
   char *name;
   size_t n_active;
@@ -147,8 +150,11 @@ int main(int argc, char **argv)
     
     // sleep 
     struct timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = 100000000L;
+    int delay = rand() / 4;
+    ts.tv_sec = delay / NSECS_IN_SEC;
+    ts.tv_nsec =  delay % NSECS_IN_SEC;
+    printf("Sleeping %lds %ldns\n", ts.tv_sec, ts.tv_nsec);
+
     nanosleep(&ts, NULL);
     
     steps += 1;

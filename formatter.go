@@ -113,6 +113,8 @@ func (formatter *Formatter) ensureDir() {
 }
 
 func (formatter *Formatter) writeTraces(trace []*StatsBucket) {
+	log.Printf("Writing trace of %d buckets", len(trace))
+
 	formatter.ensureDir()
 
 	fname := fmt.Sprintf("trace-%d.csv", time.Now().Unix())

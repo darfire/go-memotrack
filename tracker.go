@@ -54,6 +54,10 @@ func (rb *RingBuf[T]) Len() int {
 func (rb *RingBuf[T]) ToSlice() []T {
 	slice := make([]T, 0, rb.len)
 
+	if rb.len == 0 {
+		return slice
+	}
+
 	start := (rb.pos - rb.len + rb.cap) % rb.cap
 
 	end := rb.pos
@@ -213,7 +217,7 @@ func (s *StackStats) updateHist(delta uint64) {
 }
 
 func (tracker *AllocationTracker) AddEvent(event ebpfEventT) {
-	// slog.Debug("received event", "type", event.Type, "addr", event.Addr, "stackId", event.StackId, "pid", event.Pid)
+	// slog.Debug("received event", "addr", event.Addr, "stackId", event.StackId, "pidtgid", event.PidTgid, "tstamp", event.Tstamp)
 
 	probeSpec, ok := tracker.ProbeSpecs[event.ProbeId]
 
@@ -249,7 +253,6 @@ func (tracker *AllocationTracker) AddEvent(event ebpfEventT) {
 			return
 		} else {
 			tracker.IncStats(event.Tstamp, fmt.Sprintf("stack:%d:free", alloc.StackId))
-			tracker.DecStats(event.Tstamp, fmt.Sprintf("stack:%d:objects", alloc.StackId))
 		}
 	case ReferenceProbe:
 		tracker.IncStats(event.Tstamp, fmt.Sprintf("reference:%s", probeSpec.symbolName))
@@ -263,6 +266,8 @@ func (tracker *AllocationTracker) AddEvent(event ebpfEventT) {
 func (tracker *AllocationTracker) GetStatsBucket(tstamp uint64) *StatsBucket {
 	startInterval := tstamp - (tstamp % tracker.SampleIntervalNs)
 
+	// log.Printf("Getting stats bucket for tstamp %d, start interval %d", tstamp, startInterval)
+
 	last, ok := tracker.Stats.GetLast()
 
 	if !ok || last.TimeStamp != startInterval {
@@ -270,6 +275,8 @@ func (tracker *AllocationTracker) GetStatsBucket(tstamp uint64) *StatsBucket {
 			TimeStamp: startInterval,
 			Counts:    make(map[string]int64),
 		}
+
+		log.Printf("creating new stats bucket: %d, len: %d", startInterval, tracker.Stats.Len())
 
 		tracker.Stats.Add(last)
 	}

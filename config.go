@@ -23,7 +23,7 @@ func ParseConfig(path string) (Config, error) {
 	config := Config{
 		Objects:         make(map[string]ObjectSpec),
 		Executable:      "",
-		SampleSeconds:   60,
+		SampleSeconds:   10,
 		MaxStatsBuckets: 1024,
 	}
 
